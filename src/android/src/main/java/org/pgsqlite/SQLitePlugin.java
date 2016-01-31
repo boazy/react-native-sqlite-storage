@@ -20,7 +20,9 @@ import android.os.Bundle;
 import android.util.Base64;
 import android.util.Log;
 
+import java.io.DataInputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.lang.IllegalArgumentException;
 import java.lang.Number;
 import java.util.concurrent.ConcurrentHashMap;
@@ -348,6 +350,34 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
     // LOCAL METHODS
     // --------------------------------------------------------------------------
 
+    private InputStream getAssetStream(String assetFilename) throws java.io.IOException {
+        return this.getActivity().getAssets().open(assetFilename);
+    }
+
+    private static int getDbVersion(InputStream dbStream) {
+        try (DataInputStream dataStream = new DataInputStream(dbStream)) {
+            dataStream.skip(60);
+            int user_version = dataStream.readInt();
+            if (user_version <= Integer.MAX_VALUE) {
+                return user_version;
+            }
+        }
+        catch (IOException e) {
+        }
+
+        // Fail by default
+        return -1;
+    }
+
+    private static int getDbVersion(File dbFile) {
+        try {
+            return getDbVersion(new FileInputStream(dbFile));
+        }
+        catch (IOException e) {
+            return -1;
+        }
+    }
+
     /**
      *
      * @param dbname
@@ -371,6 +401,31 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
             this.getThreadPool().execute(r);
         }
     }
+
+    private class OpenDatabaseParams {
+        public boolean updateDb;
+        public boolean readOnly;
+    }
+
+    /**
+     * Opens database as read-only or read/write/create.
+     *
+     * @param dbfile   the database file to open
+     * @param readOnly if true, opens the database as read-only.
+     *                 if false, opens the database as read/write, creating a new database if necessary.
+     * @return the open database
+     */
+    private static SQLiteDatabase openDatabaseFile(File dbfile, boolean readOnly) throws SQLiteException {
+        int flags;
+        if (readOnly) {
+            flags = SQLiteDatabase.OPEN_READONLY;
+        }
+        else {
+            flags = SQLiteDatabase.CREATE_IF_NECESSARY;
+        }
+        return SQLiteDatabase.openDatabase(dbfile.getPath(), null, flags);
+    }
+
     /**
      * Open a database.
      *
@@ -380,7 +435,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
      * @return
      * @throws Exception
      */
-    private SQLiteDatabase openDatabase(String dbname, String assetFilename, CallbackContext cbc) throws Exception {
+    private SQLiteDatabase openDatabase(String dbname, String assetFilename, CallbackContext cbc, OpenDatabaseParams params) throws Exception {
         try {
             if (this.getDatabase(dbname) != null) {
                 // this should not happen - should be blocked at the execute("open") level
@@ -390,7 +445,13 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
 
             File dbfile = this.getActivity().getDatabasePath(dbname);
 
-            if (!dbfile.exists() && assetFilename != null) this.createFromAssets(dbname, assetFilename, dbfile);
+            if (assetFilename != null) {
+                if (!dbfile.exists() ||                          // Database doesn't exist yet OR
+                        ((params.updateDb || params.readOnly) && // Check for newer version in updateDb or readOnly mode
+                                (getDbVersion(dbfile) < getDbVersion(getAssetStream(assetFilename))))) {
+                    this.createFromAssets(dbname, assetFilename, dbfile);
+                }
+            }
 
             if (!dbfile.exists()) {
                 dbfile.getParentFile().mkdirs();
@@ -398,7 +459,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
 
             Log.v("info", "Open sqlite db: " + dbfile.getAbsolutePath());
 
-            SQLiteDatabase mydb = SQLiteDatabase.openOrCreateDatabase(dbfile, null);
+            SQLiteDatabase mydb = openDatabaseFile(dbfile, params.readOnly);
 
             if (cbc != null) // needed for Android locking/closing workaround
                 cbc.success("database open");
@@ -424,7 +485,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
         OutputStream out = null;
 
         try {
-            in = this.getActivity().getAssets().open(assetFilename);
+            in = getAssetStream(assetFilename);
             String dbPath = dbfile.getAbsolutePath();
             dbPath = dbPath.substring(0, dbPath.lastIndexOf("/") + 1);
 
@@ -994,6 +1055,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
         final String dbname;
         private String assetFilename;
         private boolean androidLockWorkaround;
+        private OpenDatabaseParams openDbParams = new OpenDatabaseParams();
         final BlockingQueue<DBQuery> q;
         final CallbackContext openCbc;
 
@@ -1005,7 +1067,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
             if (options.has("assetFilename")) {
               try {
                 this.assetFilename = options.getString("assetFilename");
-                if (this.assetFileName == "*default") {
+                if (this.assetFilename.equals("*default")) {
                   this.assetFilename = dbname;
                 }
               }
@@ -1013,6 +1075,8 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
                 Log.v(SQLitePlugin.class.getSimpleName(), "Unexpected value for 'options.assetFilename':", e);
               }
             }
+            this.openDbParams.updateDb = options.has("updateDB");
+            this.openDbParams.readOnly = options.has("readOnly");
             this.androidLockWorkaround = options.has("androidLockWorkaround");
             if (this.androidLockWorkaround)
                 Log.v(SQLitePlugin.class.getSimpleName(), "Android db closing/locking workaround applied");
@@ -1023,7 +1087,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
 
         public void run() {
             try {
-                this.mydb = openDatabase(dbname, this.assetFilename, this.openCbc);
+                this.mydb = openDatabase(dbname, this.assetFilename, this.openCbc, this.openDbParams);
             } catch (Exception e) {
                 Log.e(SQLitePlugin.class.getSimpleName(), "unexpected error, stopping db thread", e);
                 dbrmap.remove(dbname);
@@ -1042,7 +1106,7 @@ public class SQLitePlugin extends ReactContextBaseJavaModule implements Applicat
                     if (androidLockWorkaround && dbq.queries.length == 1 && dbq.queries[0].equals("COMMIT")) {
                         // Log.v(SQLitePlugin.class.getSimpleName(), "close and reopen db");
                         closeDatabaseNow(dbname);
-                        this.mydb = openDatabase(dbname, null, null);
+                        this.mydb = openDatabase(dbname, null, null, this.openDbParams);
                         // Log.v(SQLitePlugin.class.getSimpleName(), "close and reopen db finished");
                     }
 
