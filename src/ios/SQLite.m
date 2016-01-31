@@ -64,7 +64,32 @@ static void sqlite_regexp(sqlite3_context* context, int argc, sqlite3_value** va
   sqlite3_result_int(context, (ret != REG_NOMATCH));
 }
 
+static int sqlite_file_get_user_version(NSString* dbFilePath) {
+  NSFileHandle* file = [NSFileHandle fileHandleForReadingAtPath: dbFilePath];
+  if (file) {
+    @try {
+      // Seek to user_version header offset
+      [file seekToFileOffset: 60];
+      NSData* data = [file readDataOfLength: 4];
+      if ((data == NULL) || [data length] < 4) {
+        return -1;
+      }
+      const void *bytes = [data bytes];
+      uint32_t user_version = CFSwapInt32BigToHost(*(uint32_t*)bytes);
+      if (user_version <= INT_MAX) {
+        return user_version;
+      }
+    }
+    @catch (NSException *exception) {
+    }
+    @finally {
+      [file closeFile];
+    }        
+  }
 
+  // Return an error code on exception or any unexpected condition.
+  return -1;
+}
 
 @implementation SQLite
 
